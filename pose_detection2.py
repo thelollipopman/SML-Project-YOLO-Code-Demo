@@ -26,6 +26,8 @@ DEFAULT_COOLDOWN_FRAMES = 20
 DEFAULT_GIF_SCALE = 0.6
 WINDOW_NAME = "Meme pose detector"
 
+debug = None
+
 
 # --------------------------
 # Utility helpers
@@ -226,6 +228,7 @@ def detect_dab_pose(kp):
 
 
 def detect_t_pose(kp):
+    global debug
     needed = [
         LEFT_SHOULDER,
         RIGHT_SHOULDER,
@@ -263,20 +266,22 @@ def detect_t_pose(kp):
     )
     elbows_outward = le[0] < ls[0] and re[0] > rs[0]
     wrists_near_shoulder_height = (
-        abs(lw[1] - shoulder_y) < 0.35 * shoulder_width
-        and abs(rw[1] - shoulder_y) < 0.35 * shoulder_width
+        abs(lw[1] - shoulder_y) < 0.55 * shoulder_width
+        and abs(rw[1] - shoulder_y) < 0.55 * shoulder_width
     )
     elbows_near_shoulder_height = (
-        abs(le[1] - shoulder_y) < 0.30 * shoulder_width
-        and abs(re[1] - shoulder_y) < 0.30 * shoulder_width
+        abs(le[1] - shoulder_y) < 0.50 * shoulder_width
+        and abs(re[1] - shoulder_y) < 0.50 * shoulder_width
     )
     wrists_level = abs(lw[1] - rw[1]) < 0.20 * shoulder_width
     wide_span = abs(rw[0] - lw[0]) > 2.3 * shoulder_width
 
+    debug = f"{lw[0]: .2f} {ls[0]: .2f}"
+
     if (
         arms_straight
-        and wrists_outward
-        and elbows_outward
+        # and wrists_outward
+        # and elbows_outward
         and wrists_near_shoulder_height
         and elbows_near_shoulder_height
         and wrists_level
@@ -355,8 +360,8 @@ def update_timers(app_state):
     if app_state["detection_timer"] > 0:
         app_state["detection_timer"] -= 1
 
-
 def draw_status_text(frame, current_state, dab_state, tpose_state, app_state):
+    global debug
     cv2.putText(
         frame,
         f"state: {current_state}",
@@ -381,6 +386,15 @@ def draw_status_text(frame, current_state, dab_state, tpose_state, app_state):
         frame,
         f"tpose: {tpose_state}",
         (20, 115),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 200, 0),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"debug: {debug}",
+        (20, 140),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
         (255, 200, 0),
