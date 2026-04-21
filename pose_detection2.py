@@ -372,34 +372,34 @@ def draw_status_text(frame, current_state, dab_state, tpose_state, app_state):
         2,
     )
 
-    cv2.putText(
-        frame,
-        f"dab: {dab_state}",
-        (20, 85),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 255, 0),
-        2,
-    )
+    # cv2.putText(
+    #     frame,
+    #     f"dab: {dab_state}",
+    #     (20, 85),
+    #     cv2.FONT_HERSHEY_SIMPLEX,
+    #     0.8,
+    #     (255, 255, 0),
+    #     2,
+    # )
 
-    cv2.putText(
-        frame,
-        f"tpose: {tpose_state}",
-        (20, 115),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 200, 0),
-        2,
-    )
-    cv2.putText(
-        frame,
-        f"debug: {debug}",
-        (20, 140),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 200, 0),
-        2,
-    )
+    # cv2.putText(
+    #     frame,
+    #     f"tpose: {tpose_state}",
+    #     (20, 115),
+    #     cv2.FONT_HERSHEY_SIMPLEX,
+    #     0.8,
+    #     (255, 200, 0),
+    #     2,
+    # )
+    # cv2.putText(
+    #     frame,
+    #     f"debug: {debug}",
+    #     (20, 140),
+    #     cv2.FONT_HERSHEY_SIMPLEX,
+    #     0.8,
+    #     (255, 200, 0),
+    #     2,
+    # )
 
     if app_state["detection_timer"] > 0:
         cv2.putText(
