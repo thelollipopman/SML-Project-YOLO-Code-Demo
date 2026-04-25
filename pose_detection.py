@@ -1,42 +1,38 @@
-from ultralytics import YOLO
-import cv2
-import math
-from PIL import Image, ImageSequence
 from collections import deque
-import numpy as np
 from pathlib import Path
 
-# Call the pose model 
-model = YOLO("yolo26n-pose.pt")
+import cv2
+import numpy as np
+from PIL import Image, ImageSequence
+from ultralytics import YOLO
 
 
-# Joint connection points
-left_shoulder = 5
-right_shoulder = 6
-left_elbow = 7
-right_elbow = 8
-left_wrist = 9
-right_wrist = 10
+# --------------------------
+# Model and keypoint indices
+# --------------------------
+MODEL = YOLO("yolo26n-pose.pt")
 
-# Thresholds
-conf_thresh = 0.4
-motion_thresh = 5
-band_tolerance = 25
-forearm_margin = 15
+LEFT_SHOULDER = 5
+RIGHT_SHOULDER = 6
+LEFT_ELBOW = 7
+RIGHT_ELBOW = 8
+LEFT_WRIST = 9
+RIGHT_WRIST = 10
 
-# Temporal / Time-related
-history_len = 25
-cooldown_frames = 20
+CONF_THRESH = 0.4
+FOREARM_MARGIN = 15
+HISTORY_LEN = 25
+DEFAULT_COOLDOWN_FRAMES = 20
+DEFAULT_GIF_SCALE = 0.6
+WINDOW_NAME = "Meme pose detector"
 
-cap = cv2.VideoCapture(0)
+debug = None
 
-history = deque(maxlen=history_len)
-prev_kp = None
 
-cooldown = 0
-detection_timer = 0
-
-def load_gif_frames(path, scale=0.5):
+# --------------------------
+# Utility helpers
+# --------------------------
+def load_gif_frames(path: Path, scale: float = 0.5):
     gif = Image.open(path)
     frames = []
     durations = []
@@ -46,16 +42,14 @@ def load_gif_frames(path, scale=0.5):
         frame_np = np.array(frame)
 
         if scale != 1.0:
-            h, w = frame_np.shape[:2]
+            height, width = frame_np.shape[:2]
             frame_np = cv2.resize(
                 frame_np,
-                (int(w * scale), int(h * scale)),
-                interpolation=cv2.INTER_AREA
+                (int(width * scale), int(height * scale)),
+                interpolation=cv2.INTER_AREA,
             )
 
         frames.append(frame_np)
-
-        # duration is in milliseconds in PIL
         duration_ms = frame.info.get("duration", 40)
         durations.append(max(duration_ms / 1000.0, 0.02))
 
@@ -63,52 +57,62 @@ def load_gif_frames(path, scale=0.5):
 
 
 def overlay_rgba(background, overlay, x, y):
-    """
-    background: BGR image (OpenCV frame)
-    overlay:    RGBA image
-    x, y:       top-left corner where overlay is placed
-    """
-    bh, bw = background.shape[:2]
-    oh, ow = overlay.shape[:2]
+    """Overlay an RGBA image on top of a BGR OpenCV frame."""
+    bg_height, bg_width = background.shape[:2]
+    ov_height, ov_width = overlay.shape[:2]
 
-    # Clip to screen
-    if x >= bw or y >= bh:
+    if x >= bg_width or y >= bg_height:
         return background
-    if x + ow <= 0 or y + oh <= 0:
+    if x + ov_width <= 0 or y + ov_height <= 0:
         return background
 
     x1 = max(x, 0)
     y1 = max(y, 0)
-    x2 = min(x + ow, bw)
-    y2 = min(y + oh, bh)
+    x2 = min(x + ov_width, bg_width)
+    y2 = min(y + ov_height, bg_height)
 
-    overlay_x1 = x1 - x
-    overlay_y1 = y1 - y
-    overlay_x2 = overlay_x1 + (x2 - x1)
-    overlay_y2 = overlay_y1 + (y2 - y1)
+    ov_x1 = x1 - x
+    ov_y1 = y1 - y
+    ov_x2 = ov_x1 + (x2 - x1)
+    ov_y2 = ov_y1 + (y2 - y1)
 
-    overlay_crop = overlay[overlay_y1:overlay_y2, overlay_x1:overlay_x2]
-
-    # Split RGBA
+    overlay_crop = overlay[ov_y1:ov_y2, ov_x1:ov_x2]
     overlay_rgb = overlay_crop[:, :, :3]
     alpha = overlay_crop[:, :, 3:] / 255.0
-
-    # PIL gives RGB, OpenCV uses BGR
     overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
 
     bg_crop = background[y1:y2, x1:x2].astype(float)
     fg_crop = overlay_bgr.astype(float)
-
     blended = alpha * fg_crop + (1 - alpha) * bg_crop
     background[y1:y2, x1:x2] = blended.astype(np.uint8)
-
     return background
 
-def keypoints_confident(kp, indices, conf_thresh=conf_thresh):
-    for i in indices:
-        if kp[i, 2] < conf_thresh:
-            return False
-    return True
+
+def get_now_seconds():
+    return cv2.getTickCount() / cv2.getTickFrequency()
+
+
+def point_dist(a, b):
+    return np.linalg.norm(a[:2] - b[:2])
+
+
+def angle_deg(a, b, c):
+    """Return angle ABC in degrees."""
+    ba = a[:2] - b[:2]
+    bc = c[:2] - b[:2]
+
+    norm_ba = np.linalg.norm(ba)
+    norm_bc = np.linalg.norm(bc)
+    if norm_ba < 1e-6 or norm_bc < 1e-6:
+        return None
+
+    cos_theta = np.dot(ba, bc) / (norm_ba * norm_bc)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    return np.degrees(np.arccos(cos_theta))
+
+
+def keypoints_confident(kp, indices, conf_thresh=CONF_THRESH):
+    return all(kp[i, 2] >= conf_thresh for i in indices)
 
 
 def get_largest_person_index(result):
@@ -117,41 +121,43 @@ def get_largest_person_index(result):
 
     boxes = result.boxes.xyxy.cpu().numpy()
     areas = []
-
-    for box in boxes:
-        x1, y1, x2, y2 = box
+    for x1, y1, x2, y2 in boxes:
         areas.append((x2 - x1) * (y2 - y1))
 
     return int(np.argmax(areas))
 
 
-def get_motion_state(kp, prev_kp=None):
+# --------------------------
+# Pose detectors
+# --------------------------
+def get_motion_state(kp):
     needed = [
-        left_shoulder, right_shoulder,
-        left_elbow, right_elbow,
-        left_wrist, right_wrist
+        LEFT_SHOULDER,
+        RIGHT_SHOULDER,
+        LEFT_ELBOW,
+        RIGHT_ELBOW,
+        LEFT_WRIST,
+        RIGHT_WRIST,
     ]
 
     if not keypoints_confident(kp, needed):
         return None
 
-    le = kp[left_elbow]
-    re = kp[right_elbow]
-    lw = kp[left_wrist]
-    rw = kp[right_wrist]
+    left_elbow = kp[LEFT_ELBOW]
+    right_elbow = kp[RIGHT_ELBOW]
+    left_wrist = kp[LEFT_WRIST]
+    right_wrist = kp[RIGHT_WRIST]
 
-    left_up = lw[1] < le[1] - forearm_margin
-    left_down = lw[1] > le[1] + forearm_margin
-
-    right_up = rw[1] < re[1] - forearm_margin
-    right_down = rw[1] > re[1] + forearm_margin
+    left_up = left_wrist[1] < left_elbow[1] - FOREARM_MARGIN
+    left_down = left_wrist[1] > left_elbow[1] + FOREARM_MARGIN
+    right_up = right_wrist[1] < right_elbow[1] - FOREARM_MARGIN
+    right_down = right_wrist[1] > right_elbow[1] + FOREARM_MARGIN
 
     if left_up and right_down:
         return "L_up_R_down"
-    elif left_down and right_up:
+    if left_down and right_up:
         return "L_down_R_up"
-    else:
-        return "mid"
+    return "mid"
 
 
 def detect_six_seven(history):
@@ -160,87 +166,59 @@ def detect_six_seven(history):
 
     for state in history:
         if state in valid_states:
-            if len(compact) == 0 or compact[-1] != state:
+            if not compact or compact[-1] != state:
                 compact.append(state)
 
     if len(compact) < 3:
         return False
 
     last3 = compact[-3:]
+    return last3 in [
+        ["L_up_R_down", "L_down_R_up", "L_up_R_down"],
+        ["L_down_R_up", "L_up_R_down", "L_down_R_up"],
+    ]
 
-    return (
-        last3 == ["L_up_R_down", "L_down_R_up", "L_up_R_down"] or
-        last3 == ["L_down_R_up", "L_up_R_down", "L_down_R_up"]
-    )
-
-
-
-
-def point_dist(a, b):
-    return np.linalg.norm(a[:2] - b[:2])
-
-
-def angle_deg(a, b, c):
-    """
-    Angle ABC in degrees
-    """
-    ba = a[:2] - b[:2]
-    bc = c[:2] - b[:2]
-
-    norm_ba = np.linalg.norm(ba)
-    norm_bc = np.linalg.norm(bc)
-
-    if norm_ba < 1e-6 or norm_bc < 1e-6:
-        return None
-
-    cos_theta = np.dot(ba, bc) / (norm_ba * norm_bc)
-    cos_theta = np.clip(cos_theta, -1.0, 1.0)
-    return np.degrees(np.arccos(cos_theta))
 
 def detect_dab_pose(kp):
     needed = [
-        left_shoulder, right_shoulder,
-        left_elbow, right_elbow,
-        left_wrist, right_wrist
+        LEFT_SHOULDER,
+        RIGHT_SHOULDER,
+        LEFT_ELBOW,
+        RIGHT_ELBOW,
+        LEFT_WRIST,
+        RIGHT_WRIST,
     ]
 
     if not keypoints_confident(kp, needed):
         return None
 
-    ls = kp[left_shoulder]
-    rs = kp[right_shoulder]
-    le = kp[left_elbow]
-    re = kp[right_elbow]
-    lw = kp[left_wrist]
-    rw = kp[right_wrist]
+    ls = kp[LEFT_SHOULDER]
+    rs = kp[RIGHT_SHOULDER]
+    le = kp[LEFT_ELBOW]
+    re = kp[RIGHT_ELBOW]
+    lw = kp[LEFT_WRIST]
+    rw = kp[RIGHT_WRIST]
 
     shoulder_width = point_dist(ls, rs)
     if shoulder_width < 1:
         return None
 
-    # Elbow angles
     left_angle = angle_deg(ls, le, lw)
     right_angle = angle_deg(rs, re, rw)
+    if left_angle is None or right_angle is None:
+        return None
 
-    # ----- Left dab -----
-    # left arm straight-ish and raised
     left_arm_up = lw[1] < le[1] < ls[1]
-    left_arm_straight = left_angle is not None and left_angle > 145
-
-    # right arm bent across face/chest area
-    right_arm_bent = right_angle is not None and right_angle < 110
+    left_arm_straight = left_angle > 145
+    right_arm_bent = right_angle < 110
     right_wrist_near_left_side = point_dist(rw, ls) < 1.2 * shoulder_width
 
     if left_arm_up and left_arm_straight and right_arm_bent and right_wrist_near_left_side:
         return "left_dab"
 
-    # ----- Right dab -----
-    # right arm straight-ish and raised
     right_arm_up = rw[1] < re[1] < rs[1]
-    right_arm_straight = right_angle is not None and right_angle > 145
-
-    # left arm bent across face/chest area
-    left_arm_bent = left_angle is not None and left_angle < 110
+    right_arm_straight = right_angle > 145
+    left_arm_bent = left_angle < 110
     left_wrist_near_right_side = point_dist(lw, rs) < 1.2 * shoulder_width
 
     if right_arm_up and right_arm_straight and left_arm_bent and left_wrist_near_right_side:
@@ -248,158 +226,328 @@ def detect_dab_pose(kp):
 
     return None
 
-# Load the gifs
 
-directory = Path(__file__).resolve().parent
+def detect_t_pose(kp):
+    global debug
+    needed = [
+        LEFT_SHOULDER,
+        RIGHT_SHOULDER,
+        LEFT_ELBOW,
+        RIGHT_ELBOW,
+        LEFT_WRIST,
+        RIGHT_WRIST,
+    ]
 
-gif_67_frames, gif_67_durations = load_gif_frames(directory / "gifs" / "67.gif", scale=0.6)
-gif_dab_frames, gif_dab_durations = load_gif_frames(directory / "gifs" / "dab.gif", scale=0.6)
+    if not keypoints_confident(kp, needed):
+        return None
 
-active_gif_frames = []
-active_gif_durations = []
-active_gif_name = None
+    ls = kp[LEFT_SHOULDER]
+    rs = kp[RIGHT_SHOULDER]
+    le = kp[LEFT_ELBOW]
+    re = kp[RIGHT_ELBOW]
+    lw = kp[LEFT_WRIST]
+    rw = kp[RIGHT_WRIST]
 
-gif_index = 0
-gif_playing = False
-gif_loops_left = 0
-last_gif_time = 0
+    shoulder_width = point_dist(ls, rs)
+    if shoulder_width < 1:
+        return None
 
-active_detection_label = ""
+    left_angle = angle_deg(ls, le, lw)
+    right_angle = angle_deg(rs, re, rw)
+    if left_angle is None or right_angle is None:
+        return None
+
+    shoulder_y = 0.5 * (ls[1] + rs[1])
+
+    arms_straight = left_angle > 155 and right_angle > 155
+    wrists_outward = (
+        lw[0] < ls[0] - 0.35 * shoulder_width
+        and rw[0] > rs[0] + 0.35 * shoulder_width
+    )
+    elbows_outward = le[0] < ls[0] and re[0] > rs[0]
+    wrists_near_shoulder_height = (
+        abs(lw[1] - shoulder_y) < 0.55 * shoulder_width
+        and abs(rw[1] - shoulder_y) < 0.55 * shoulder_width
+    )
+    elbows_near_shoulder_height = (
+        abs(le[1] - shoulder_y) < 0.50 * shoulder_width
+        and abs(re[1] - shoulder_y) < 0.50 * shoulder_width
+    )
+    wrists_level = abs(lw[1] - rw[1]) < 0.20 * shoulder_width
+    wide_span = abs(rw[0] - lw[0]) > 2.3 * shoulder_width
+
+    debug = f"{lw[0]: .2f} {ls[0]: .2f}"
+
+    if (
+        arms_straight
+        # and wrists_outward
+        # and elbows_outward
+        and wrists_near_shoulder_height
+        and elbows_near_shoulder_height
+        and wrists_level
+        and wide_span
+    ):
+        return "tpose"
+
+    return None
 
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+def detect_triggered_pose(kp, history):
+    dab_state = detect_dab_pose(kp)
+    tpose_state = detect_t_pose(kp)
 
-    annotated = frame.copy()
-    current_state = None
-    dab_state = None
+    if detect_six_seven(history):
+        return "67", {"dab_state": dab_state, "tpose_state": tpose_state}
 
-    # Run YOLO pose
-    results = model(frame, verbose=False)
+    if dab_state is not None:
+        return "dab", {"dab_state": dab_state, "tpose_state": tpose_state}
 
-    if len(results) > 0:
-        result = results[0]
+    if tpose_state is not None:
+        return "tpose", {"dab_state": dab_state, "tpose_state": tpose_state}
 
-        person_idx = get_largest_person_index(result)
+    return None, {"dab_state": dab_state, "tpose_state": tpose_state}
 
-        if result.keypoints is not None and person_idx is not None:
-            kpts = result.keypoints.data
 
-            if kpts is not None and len(kpts) > person_idx:
-                kp = kpts[person_idx].cpu().numpy()
-                dab_state = detect_dab_pose(kp)
+# --------------------------
+# Effect / animation control
+# --------------------------
+def init_app_state():
+    return {
+        "cooldown": 0,
+        "detection_timer": 0,
+        "active_detection_label": "",
+        "gif_playing": False,
+        "gif_index": 0,
+        "gif_loops_left": 0,
+        "last_gif_time": 0.0,
+        "active_gif_name": None,
+        "active_gif_frames": [],
+        "active_gif_durations": [],
+    }
 
-                # Get motion state
-                current_state = get_motion_state(kp, prev_kp)
 
-                # Update history
-                history.append(current_state)
+def start_pose_effect(app_state, pose_name, pose_config, gifs):
+    app_state["detection_timer"] = pose_config.get("timer_frames", 20)
+    app_state["cooldown"] = pose_config.get("cooldown_frames", DEFAULT_COOLDOWN_FRAMES)
+    app_state["active_detection_label"] = pose_config["label"]
 
-                # Detect gesture
-                detected = False
-                if cooldown == 0 and detect_six_seven(history):
-                    detected = True
-                    detection_timer = 20
-                    cooldown = cooldown_frames
+    gif_key = pose_config.get("gif")
+    gif_data = gifs.get(gif_key) if gif_key else None
 
-                    active_gif_frames = gif_67_frames
-                    active_gif_durations = gif_67_durations
-                    active_gif_name = "67"
+    if gif_data is None:
+        app_state["gif_playing"] = False
+        app_state["gif_index"] = 0
+        app_state["gif_loops_left"] = 0
+        app_state["last_gif_time"] = 0.0
+        app_state["active_gif_name"] = None
+        app_state["active_gif_frames"] = []
+        app_state["active_gif_durations"] = []
+        return
 
-                    gif_playing = True
-                    gif_index = 0
-                    gif_loops_left = 2
-                    last_gif_time = cv2.getTickCount() / cv2.getTickFrequency()
+    frames, durations = gif_data
+    app_state["gif_playing"] = True
+    app_state["gif_index"] = 0
+    app_state["gif_loops_left"] = pose_config.get("loops", 1)
+    app_state["last_gif_time"] = get_now_seconds()
+    app_state["active_gif_name"] = pose_name
+    app_state["active_gif_frames"] = frames
+    app_state["active_gif_durations"] = durations
 
-                    active_detection_label = "6 7 DETECTED"
 
-                elif cooldown == 0 and dab_state is not None:
-                    detection_timer = 20
-                    cooldown = cooldown_frames
+def update_timers(app_state):
+    if app_state["cooldown"] > 0:
+        app_state["cooldown"] -= 1
+    if app_state["detection_timer"] > 0:
+        app_state["detection_timer"] -= 1
 
-                    active_gif_frames = gif_dab_frames
-                    active_gif_durations = gif_dab_durations
-                    active_gif_name = "dab"
-
-                    gif_playing = True
-                    gif_index = 0
-                    gif_loops_left = 1
-                    last_gif_time = cv2.getTickCount() / cv2.getTickFrequency()
-
-                    active_detection_label = "DAB DETECTED"
-
-                prev_kp = kp
-
-                # Draw YOLO output
-                annotated = result.plot()
-            else:
-                history.append(None)
-                prev_kp = None
-        else:
-            history.append(None)
-            prev_kp = None
-    else:
-        history.append(None)
-        prev_kp = None
-
-    # Update timers
-    if cooldown > 0:
-        cooldown -= 1
-
-    if detection_timer > 0:
-        detection_timer -= 1
-
-    # Overlay text
+def draw_status_text(frame, current_state, dab_state, tpose_state, app_state):
+    global debug
     cv2.putText(
-        annotated,
+        frame,
         f"state: {current_state}",
         (20, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         1,
         (0, 255, 0),
-        2
+        2,
     )
 
-    if detection_timer > 0:
+    # cv2.putText(
+    #     frame,
+    #     f"dab: {dab_state}",
+    #     (20, 85),
+    #     cv2.FONT_HERSHEY_SIMPLEX,
+    #     0.8,
+    #     (255, 255, 0),
+    #     2,
+    # )
+
+    # cv2.putText(
+    #     frame,
+    #     f"tpose: {tpose_state}",
+    #     (20, 115),
+    #     cv2.FONT_HERSHEY_SIMPLEX,
+    #     0.8,
+    #     (255, 200, 0),
+    #     2,
+    # )
+    # cv2.putText(
+    #     frame,
+    #     f"debug: {debug}",
+    #     (20, 140),
+    #     cv2.FONT_HERSHEY_SIMPLEX,
+    #     0.8,
+    #     (255, 200, 0),
+    #     2,
+    # )
+
+    if app_state["detection_timer"] > 0:
         cv2.putText(
-            annotated,
-            active_detection_label,
-            (20, 90),
+            frame,
+            app_state["active_detection_label"],
+            (20, 165),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.2,
             (0, 0, 255),
-            3
+            3,
         )
 
 
-    # Overlay gif
-    if gif_playing and len(active_gif_frames) > 0:
-        current_gif = active_gif_frames[gif_index]
+def update_and_draw_gif(frame, app_state, x_margin=20, y_margin=20):
+    if not app_state["gif_playing"] or not app_state["active_gif_frames"]:
+        return frame
 
-        gh, gw = current_gif.shape[:2]
-        h, w = annotated.shape[:2]
-        x = w - gw - 20
-        y = 20
+    current_gif = app_state["active_gif_frames"][app_state["gif_index"]]
+    gif_height, gif_width = current_gif.shape[:2]
+    frame_height, frame_width = frame.shape[:2]
 
-        annotated = overlay_rgba(annotated, current_gif, x, y)
+    x = frame_width - gif_width - x_margin
+    y = y_margin
+    frame = overlay_rgba(frame, current_gif, x, y)
 
-        now = cv2.getTickCount() / cv2.getTickFrequency()
-        if now - last_gif_time >= active_gif_durations[gif_index]:
-            gif_index += 1
-            last_gif_time = now
+    now = get_now_seconds()
+    current_duration = app_state["active_gif_durations"][app_state["gif_index"]]
 
-            if gif_index >= len(active_gif_frames):
-                gif_index = 0
-                gif_loops_left -= 1
-                if gif_loops_left <= 0:
-                    gif_playing = False
-                    active_gif_name = None
+    if now - app_state["last_gif_time"] >= current_duration:
+        app_state["gif_index"] += 1
+        app_state["last_gif_time"] = now
 
-    # Show frame
-    cv2.imshow("6 7 detector", annotated)
+        if app_state["gif_index"] >= len(app_state["active_gif_frames"]):
+            app_state["gif_index"] = 0
+            app_state["gif_loops_left"] -= 1
+            if app_state["gif_loops_left"] <= 0:
+                app_state["gif_playing"] = False
+                app_state["active_gif_name"] = None
+                app_state["active_gif_frames"] = []
+                app_state["active_gif_durations"] = []
 
-    # Exit
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+    return frame
+
+
+# --------------------------
+# Pose registry and assets
+# --------------------------
+def build_pose_registry():
+    return {
+        "67": {
+            "label": "6 7 DETECTED",
+            "gif": "67",
+            "loops": 2,
+            "cooldown_frames": 20,
+            "timer_frames": 20,
+        },
+        "dab": {
+            "label": "DAB DETECTED",
+            "gif": "dab",
+            "loops": 1,
+            "cooldown_frames": 20,
+            "timer_frames": 20,
+        },
+        "tpose": {
+            "label": "T POSE DETECTED",
+            "gif": "tpose",
+            "loops": 1,
+            "cooldown_frames": 20,
+            "timer_frames": 20,
+        },
+    }
+
+
+def build_gif_registry(base_dir: Path):
+    gif_dir = base_dir / "gifs"
+    gifs = {}
+
+    for name in ["67", "dab", "tpose"]:
+        gif_path = gif_dir / f"{name}.gif"
+        if gif_path.exists():
+            gifs[name] = load_gif_frames(gif_path, scale=DEFAULT_GIF_SCALE)
+
+    return gifs
+
+
+# --------------------------
+# Main application loop
+# --------------------------
+def run():
+    base_dir = Path(__file__).resolve().parent
+    poses = build_pose_registry()
+    gifs = build_gif_registry(base_dir)
+    app_state = init_app_state()
+
+    cap = cv2.VideoCapture(0)
+    history = deque(maxlen=HISTORY_LEN)
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            annotated = frame.copy()
+            current_state = None
+            dab_state = None
+            tpose_state = None
+
+            results = MODEL(frame, verbose=False)
+
+            if results:
+                result = results[0]
+                person_idx = get_largest_person_index(result)
+
+                if result.keypoints is not None and person_idx is not None:
+                    kpts = result.keypoints.data
+
+                    if kpts is not None and len(kpts) > person_idx:
+                        kp = kpts[person_idx].cpu().numpy()
+                        current_state = get_motion_state(kp)
+                        history.append(current_state)
+
+                        pose_name, debug_info = detect_triggered_pose(kp, history)
+                        dab_state = debug_info["dab_state"]
+                        tpose_state = debug_info["tpose_state"]
+
+                        if app_state["cooldown"] == 0 and pose_name is not None:
+                            start_pose_effect(app_state, pose_name, poses[pose_name], gifs)
+
+                        annotated = result.plot()
+                    else:
+                        history.append(None)
+                else:
+                    history.append(None)
+            else:
+                history.append(None)
+
+            update_timers(app_state)
+            draw_status_text(annotated, current_state, dab_state, tpose_state, app_state)
+            annotated = update_and_draw_gif(annotated, app_state)
+
+            cv2.imshow(WINDOW_NAME, annotated)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    run()
