@@ -2,7 +2,6 @@ from ultralytics import YOLO
 import cv2
 import math
 from PIL import Image
-from IPython.display import display, clear_output
 from collections import deque
 import numpy as np
 
@@ -13,17 +12,8 @@ model = YOLO("yolo26n.pt")
 # Thresholds
 conf_thresh = 0.4
 
-# Temporal / Time-related
-history_len = 25
-cooldown_frames = 20
-
+# Webcam video capture
 cap = cv2.VideoCapture(0)
-
-history = deque(maxlen=history_len)
-
-cooldown = 0
-detection_timer = 0
-
 
 def get_largest_object_index(result):
     if result.boxes is None or len(result.boxes) == 0:
@@ -74,26 +64,8 @@ while True:
         if result.boxes is not None and obj_idx is not None:
             current_object = get_detected_object_name(result, obj_idx)
 
-            # Update history
-            history.append(current_object)
-
-            if cooldown == 0 and current_object is not None:
-                detection_timer = 20
-                cooldown = cooldown_frames
-
             # Draw YOLO output
             annotated = result.plot()
-        else:
-            history.append(None)
-    else:
-        history.append(None)
-
-    # Update timers
-    if cooldown > 0:
-        cooldown -= 1
-
-    if detection_timer > 0:
-        detection_timer -= 1
 
     # Overlay text
     cv2.putText(
